@@ -4,7 +4,7 @@ Formerly Zip Ship Cleaner (v3.8). Clean and pack Gear apps for GitHub / Vercel.
 
 # Zip Ship Cleaner
 
-**Version 3.8.0** — **Capstiller Vercel Ship Packager**.
+**Version 3.9.0** — **Capstiller Vercel Ship Packager**.
 
 Upload a project zip + app name + icon → download a cleaned zip ready for Vercel, with PWA/install metadata so device home screens show the name under the icon.
 
@@ -19,6 +19,14 @@ Still strips sandbox ID crumbs, **fixes broken Vite / Vercel-ready** issues from
 **v3.5** rewrites dangling **`/__grok/`** install-asset hrefs when **grok strip** and/or **PWA pack** is ON. Grok sandbox HTML/TS/JS often keep `rel="apple-touch-icon" href="/__grok/icon-180.png"` and `manifest` → `/__grok/manifest.webmanifest` even after the pack injects `/apple-touch-icon.png` + `/manifest.webmanifest` into `public/` (and after `__grok/**` is deleted). Those `__grok` URLs 404 or serve tiny junk → Chrome home-screen letter icons (G/V). Zip Ship now path-rewrites those refs in `*.html`, `*.tsx`, `*.jsx`, `*.ts`, `*.js` (and similar) to the pack assets, and PWA pack still upserts correct `<link rel="apple-touch-icon">` + `<link rel="manifest">` in `index.html`.
 
 **v3.6** adds **Tweak** mode (top-level **Clean | Tweak** switch). Upload a project zip, get a best-effort **live preview** of the lander from `dist/index.html` (else root / `public/index.html`) with asset URLs rewritten to blob object URLs, or an **Editable inventory** fallback when no HTML is previewable. Clicks select elements (links do **not** navigate). Simple edits only: text, image replace/remove, link href change/clear. Download a tweaked zip. Clean mode is unchanged.
+
+**v3.9.0** — **Protected files + organized review + confirm step** (after an I Still clean wiped `public/sprites` / `public/art`).
+- **Protected by default, never auto/bulk removed:** everything under `public/`, `static/`, `assets/` (incl. `src/assets/`), anything in `src/`, any image / sound / video / font / 3D file anywhere (png jpg jpeg gif webp avif svg ico bmp mp3 wav ogg m4a aac flac mp4 webm mov glb gltf obj fbx ttf otf woff woff2), and any file whose name appears in `src/**` or `index.html` text. Hard junk folders are still always removed (`node_modules/`, `.git/`, `.vercel/`, `__MACOSX/`, `.grok/`, `__grok/`, top-level `dist/` `build/` `.next/` …). A build-dir name nested under `public/` / `assets/` / `src/` is not junk.
+- **Only way to drop a protected file:** uncheck its **Keep** box in Media review (shows a warning). "Remove unprotected videos" skips protected files. The `*.wav` opt-in removes only loose WAVs not in `public/` and not used by code.
+- **Review list** in plain words with counts, sizes and collapsible lists: *Will remove: build junk*, *Will remove: images & sounds you unchecked*, *Kept: images & sounds*, *Kept: app code*, *Kept: other files*.
+- **Backup zips** (`*.zip` inside the upload) get their own group, **kept by default**. One-tap **Remove backup zips** plus per-zip checkboxes. Each zip is opened to count images inside that aren't anywhere else in the upload; optional **Pull missing images out of the zip, then remove it** (one copy per filename, lands in `public/…`, never overwrites).
+- **Nothing is removed until you confirm:** *Clean & download…* opens a confirm step listing every image/sound that would be removed and any backup-zip notes (e.g. "I-Still.zip has 10 image/sound files not found elsewhere in the upload").
+- Tests: `npm test` (node --test, loads TS via Vite SSR).
 
 **v3.8.0** bakes **Base app Recents/Discover + OKX wallet / store preview** into every Clean (with PWA pack): Open Graph + Twitter tags (`og:title` / `twitter:title` aligned to PWA app name), `og:image` / `twitter:image` pointing at `/og.jpg` (absolute when optional **Public site URL** is set, else root-relative), favicon links (`/favicon-32.png` + generated `favicon.ico` when possible; SVG favicons kept), and copies `icon-512.png` / apple-touch → `og.jpg` when missing. Optional **Output zip name** on Clean (and Tweak) overrides the download filename (`.zip` appended if omitted). Optional checkbox **Want a CAPSTILLER Easteregg?** (default OFF) injects `public/cap-easter-egg.png` + `cap-easter-egg.js` (and TanStack root like the password gate): one random non-interactive letter shows the Cap cutout sticker at **3×** letter height while pressed.
 

@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import {
   formatBytes,
+  PROTECT_REASON_LABELS,
   type MediaEntry,
   type MediaKind,
 } from './lib/cleanZip'
@@ -92,12 +93,12 @@ function MediaRow({
         <label className="flex items-start gap-2 cursor-pointer shrink-0 pt-0.5">
           <input
             type="checkbox"
-            className="mt-0.5 size-4 accent-rose-400"
-            checked={markedRemove}
-            onChange={(e) => onToggle(entry.path, e.target.checked)}
-            aria-label={`Remove ${entry.path}`}
+            className="mt-0.5 size-5 accent-emerald-400"
+            checked={!markedRemove}
+            onChange={(e) => onToggle(entry.path, !e.target.checked)}
+            aria-label={`Keep ${entry.path}`}
           />
-          <span className="text-xs text-zinc-500 hidden sm:inline w-14">
+          <span className="text-xs text-zinc-400 w-12">
             {markedRemove ? 'Remove' : 'Keep'}
           </span>
         </label>
@@ -112,6 +113,11 @@ function MediaRow({
             <span className="text-xs text-zinc-500 tabular-nums">
               {formatBytes(entry.size)}
             </span>
+            {entry.protectedBy ? (
+              <span className="inline-flex items-center rounded border border-emerald-800/60 bg-emerald-950/60 px-1.5 py-0.5 text-[10px] text-emerald-300">
+                protected · {PROTECT_REASON_LABELS[entry.protectedBy]}
+              </span>
+            ) : null}
           </div>
           <p
             className={[
@@ -124,6 +130,14 @@ function MediaRow({
           >
             {entry.path}
           </p>
+          {markedRemove ? (
+            <p className="mt-1 text-[11px] text-rose-300">
+              ⚠ {entry.protectedBy
+                ? `Protected file (${PROTECT_REASON_LABELS[entry.protectedBy]}). Your app may break without it.`
+                : 'Will be removed from the clean zip.'}{' '}
+              Re-check Keep to undo.
+            </p>
+          ) : null}
         </div>
 
         <button
@@ -210,8 +224,9 @@ export function MediaReview({
 
   const removeAllVideos = () => {
     const next = new Set(removePaths)
+    // Bulk action never touches protected files — uncheck those one by one
     for (const e of entries) {
-      if (e.kind === 'video') next.add(e.path)
+      if (e.kind === 'video' && !e.protectedBy) next.add(e.path)
     }
     onChangeRemovePaths(next)
   }
@@ -243,10 +258,9 @@ export function MediaReview({
         </span>
       </div>
       <p className="text-xs text-zinc-500 mb-3 leading-relaxed">
-        Preview images, audio, and video from the zip. Removal is{' '}
-        <span className="text-zinc-400">opt-in</span> (default keep) — nothing
-        is auto-stripped here. Marked files are omitted from the clean zip in
-        addition to strip rules.
+        Every image, sound and video is <span className="text-emerald-300">kept</span>{' '}
+        by default and protected from cleanup rules. To drop one, uncheck its
+        Keep box. You'll see a warning before anything is removed.
       </p>
 
       <div className="flex flex-wrap gap-2 text-[11px] text-zinc-400 mb-3">
@@ -280,10 +294,10 @@ export function MediaReview({
         <button
           type="button"
           onClick={removeAllVideos}
-          disabled={totals.byKind.video.count === 0}
+          disabled={!entries.some((e) => e.kind === 'video' && !e.protectedBy)}
           className="rounded-md border border-rose-900/60 bg-rose-950/40 px-2.5 py-1 text-xs text-rose-200 hover:border-rose-700 disabled:opacity-40"
         >
-          Remove all videos
+          Remove unprotected videos
         </button>
         <button
           type="button"

@@ -141,6 +141,10 @@ export type EntryInfo = {
   size: number
   remove: boolean
   bucket: RemovalBucket | null
+  /** Why this file is protected from bulk/auto removal (null = not protected) */
+  protectedBy: ProtectReason | null
+  /** Rule that matched but was skipped because the file is protected */
+  savedFrom: RemovalBucket | null
 }
 
 export type ViteScriptFixInfo = {
@@ -173,6 +177,8 @@ export type ScanResult = {
   hostStrip: HostStripInfo
   /** Kept *.wav entries that would convert when convertWavToMp3 is ON */
   wavConvertCandidates: { path: string; size: number }[]
+  /** Files a strip rule matched but that were kept because they're protected */
+  protectedSaved: number
 }
 
 const DEFAULT_VITE_VERSION = '^8.3.0'
@@ -326,6 +332,310 @@ export function classifyPath(
   return { remove: false, bucket: null }
 }
 
+// ---------------------------------------------------------------------------
+// Protection (v3.9): images, sounds, public/ and files your code uses are
+// never removed by automatic / bulk rules. Only an individual per-file
+// override (Media review "Keep" unchecked) can drop them.
+// ---------------------------------------------------------------------------
+
+export type ProtectReason = 'public' | 'assets' | 'src' | 'media' | 'referenced'
+
+export const PROTECT_REASON_LABELS: Record<ProtectReason, string> = {
+  public: 'in public/',
+  assets: 'in an assets/static folder',
+  src: 'in src/',
+  media: 'image / sound / font / 3D file',
+  referenced: 'used by your code',
+}
+
+/** Folders whose contents ship with the app as-is */
+export const PROTECTED_DIRS = ['public', 'static', 'assets'] as const
+
+/** Media/asset extensions protected anywhere (outside junk folders) */
+export const PROTECTED_MEDIA_EXTS = new Set([
+  'png', 'jpg', 'jpeg', 'gif', 'webp', 'avif', 'svg', 'ico', 'bmp',
+  'mp3', 'wav', 'ogg', 'm4a', 'aac', 'flac',
+  'mp4', 'webm', 'mov', 'm4v',
+  'glb', 'gltf', 'obj', 'fbx',
+  'ttf', 'otf', 'woff', 'woff2',
+])
+
+/** Dependency / VCS / sandbox folders — never protected, contents always junk */
+const HARD_JUNK_DIRS = new Set([
+  'node_modules',
+  '.git',
+  '.vercel',
+  '__MACOSX',
+  '.grok',
+  '__grok',
+])
+
+/** Folders that "anchor" a build-dir name as real source (public/build/x.png, src/build/) */
+const BUILD_ANCHOR_DIRS = new Set(['public', 'static', 'assets', 'src'])
+
+function extOf(path: string): string {
+  const name = basename(path).toLowerCase()
+  const dot = name.lastIndexOf('.')
+  return dot < 0 ? '' : name.slice(dot + 1)
+}
+
+export function isProtectedMediaPath(path: string): boolean {
+  return PROTECTED_MEDIA_EXTS.has(extOf(path))
+}
+
+/**
+ * True when the path lives in a dependency / build-output / OS-junk folder
+ * (node_modules, .git, .vercel, __MACOSX, top-level dist/build/.next…).
+ * A build-dir name nested under public/, assets/, static/ or src/ is NOT junk.
+ */
+export function isInsideJunkFolder(rawPath: string): boolean {
+  const parts = pathParts(rawPath)
+  const dirs = parts.slice(0, -1)
+  let anchored = false
+  for (const d of dirs) {
+    if (HARD_JUNK_DIRS.has(d)) return true
+    if (BUILD_ANCHOR_DIRS.has(d.toLowerCase())) anchored = true
+    if (!anchored && (BUILD_DIR_NAMES as readonly string[]).includes(d)) return true
+  }
+  return false
+}
+
+const REF_SOURCE_EXT = /\.(tsx?|jsx?|mjs|cjs|vue|svelte|astro|css|scss|sass|less|html?|json)$/i
+const REF_MAX_FILE_BYTES = 3 * 1024 * 1024
+
+/**
+ * Filename-like tokens (e.g. "door.png") mentioned in src/** text files and
+ * any index.html. Used to protect files your code references by name.
+ */
+export function collectReferencedNames(
+  files: Record<string, Uint8Array>,
+): Set<string> {
+  const names = new Set<string>()
+  for (const [rawPath, bytes] of Object.entries(files)) {
+    const path = normalizePath(rawPath)
+    if (isInsideJunkFolder(path)) continue
+    const parts = pathParts(path)
+    const isIndexHtml = basename(path).toLowerCase() === 'index.html'
+    if (!isIndexHtml && !parts.slice(0, -1).includes('src')) continue
+    if (!REF_SOURCE_EXT.test(path)) continue
+    if (bytes.byteLength > REF_MAX_FILE_BYTES) continue
+    const text = decodeText(bytes)
+    const re = /[A-Za-z0-9_@\-.]+\.[A-Za-z0-9]{1,6}/g
+    let m: RegExpExecArray | null
+    while ((m = re.exec(text))) names.add(m[0].toLowerCase())
+  }
+  return names
+}
+
+/** Map of path → protect reason for every protected file in the upload */
+export function computeProtection(
+  files: Record<string, Uint8Array>,
+): Map<string, ProtectReason> {
+  const out = new Map<string, ProtectReason>()
+  const refs = collectReferencedNames(files)
+  for (const rawPath of Object.keys(files)) {
+    const path = normalizePath(rawPath)
+    if (!path || path.endsWith('/')) continue
+    if (isInsideJunkFolder(path)) continue
+    const dirs = pathParts(path).slice(0, -1).map((d) => d.toLowerCase())
+    if (dirs.includes('public')) out.set(path, 'public')
+    else if (dirs.includes('assets') || dirs.includes('static')) out.set(path, 'assets')
+    else if (refs.has(basename(path).toLowerCase())) out.set(path, 'referenced')
+    else if (isProtectedMediaPath(path)) out.set(path, 'media')
+    else if (dirs.includes('src')) out.set(path, 'src')
+  }
+  return out
+}
+
+/** Rule buckets that protection can override (others are always junk) */
+const SOFT_BUCKETS = new Set<RemovalBucket>(['build_dirs', 'logs', 'wav'])
+
+export type ProtectedClassification = {
+  remove: boolean
+  bucket: RemovalBucket | null
+  protectedBy: ProtectReason | null
+  savedFrom: RemovalBucket | null
+}
+
+/**
+ * classifyPath + protection. Hard junk (node_modules, .git, .vercel, OS junk,
+ * grok/sandbox leftovers) is always removed. Soft rules (build dirs, logs,
+ * wav opt-in) skip protected files. The explicit "Remove *.wav" opt-in still
+ * removes loose WAVs that are only protected by extension (not in public/,
+ * not used by code).
+ */
+export function classifyWithProtection(
+  rawPath: string,
+  opts: CleanOptions,
+  protection: Map<string, ProtectReason>,
+): ProtectedClassification {
+  const path = normalizePath(rawPath)
+  const base = classifyPath(path, opts)
+  const reason = protection.get(path) ?? null
+  if (!base.remove || !base.bucket) {
+    return { remove: false, bucket: null, protectedBy: reason, savedFrom: null }
+  }
+  if (reason && SOFT_BUCKETS.has(base.bucket)) {
+    if (base.bucket === 'wav' && reason === 'media') {
+      return { ...base, protectedBy: null, savedFrom: null }
+    }
+    return { remove: false, bucket: null, protectedBy: reason, savedFrom: base.bucket }
+  }
+  return { ...base, protectedBy: null, savedFrom: null }
+}
+
+// ---------------------------------------------------------------------------
+// Backup zips (*.zip inside the upload) — kept by default; may hold the only
+// copy of images. Can be removed per zip or all at once; missing images can be
+// pulled out first.
+// ---------------------------------------------------------------------------
+
+export type BackupZipMedia = {
+  innerPath: string
+  /** Where it would land if pulled out */
+  targetPath: string
+  size: number
+}
+
+export type BackupZipInfo = {
+  path: string
+  size: number
+  /** Image / sound / font / 3D files inside (junk folders skipped) */
+  mediaCount: number
+  /** Media inside whose filename isn't anywhere else in the upload */
+  missingMedia: BackupZipMedia[]
+  error: string | null
+}
+
+const PULL_ANCHORS = new Set(['public', 'assets', 'static', 'src'])
+
+function pullTargetFor(zipPath: string, innerPath: string): string {
+  const parts = pathParts(innerPath)
+  const idx = parts.findIndex((p) => PULL_ANCHORS.has(p.toLowerCase()))
+  const zipDir = pathParts(zipPath).slice(0, -1).join('/')
+  const zipStem = basename(zipPath).replace(/\.zip$/i, '')
+  const rel =
+    idx >= 0 ? parts.slice(idx).join('/') : `recovered-from-${zipStem}/${parts.join('/')}`
+  return zipDir ? `${zipDir}/${rel}` : rel
+}
+
+function unzipMedia(bytes: Uint8Array): Record<string, Uint8Array> {
+  return unzipSync(bytes, {
+    filter: (f) =>
+      !f.name.endsWith('/') && isProtectedMediaPath(f.name) && !isInsideJunkFolder(f.name),
+  })
+}
+
+export function isBackupZipPath(rawPath: string): boolean {
+  const path = normalizePath(rawPath)
+  return /\.zip$/i.test(path) && !isInsideJunkFolder(path)
+}
+
+export function analyzeBackupZips(
+  files: Record<string, Uint8Array>,
+): BackupZipInfo[] {
+  const zipPaths = Object.keys(files).map(normalizePath).filter(isBackupZipPath)
+  if (zipPaths.length === 0) return []
+  const outerNames = new Set<string>()
+  for (const raw of Object.keys(files)) {
+    const p = normalizePath(raw)
+    if (isInsideJunkFolder(p) || /\.zip$/i.test(p)) continue
+    outerNames.add(basename(p).toLowerCase())
+  }
+  const out: BackupZipInfo[] = []
+  for (const zipPath of zipPaths.sort()) {
+    const key = findFileKey(files, zipPath)
+    const bytes = key ? files[key] : undefined
+    if (!bytes) continue
+    try {
+      const inner = unzipMedia(bytes)
+      const missingMedia: BackupZipMedia[] = []
+      for (const [innerPath, b] of Object.entries(inner)) {
+        if (outerNames.has(basename(innerPath).toLowerCase())) continue
+        missingMedia.push({
+          innerPath,
+          targetPath: pullTargetFor(zipPath, innerPath),
+          size: b.byteLength,
+        })
+      }
+      missingMedia.sort((a, b) => a.innerPath.localeCompare(b.innerPath))
+      out.push({
+        path: zipPath,
+        size: bytes.byteLength,
+        mediaCount: Object.keys(inner).length,
+        missingMedia,
+        error: null,
+      })
+    } catch (e) {
+      out.push({
+        path: zipPath,
+        size: bytes.byteLength,
+        mediaCount: 0,
+        missingMedia: [],
+        error: e instanceof Error ? e.message : 'Could not open zip',
+      })
+    }
+  }
+  return out
+}
+
+export type PlannedPull = { zipPath: string; innerPath: string; targetPath: string }
+
+/**
+ * Which images to pull out of the zips being removed. One copy per filename
+ * (zips whose images land in public/ etc. win over recovered-from-… paths);
+ * never targets a path that already exists.
+ */
+export function planMediaPulls(
+  infos: BackupZipInfo[],
+  zipPaths: Iterable<string>,
+  existingPaths: Iterable<string> = [],
+): PlannedPull[] {
+  const wanted = new Set([...zipPaths].map(normalizePath))
+  const existing = new Set([...existingPaths].map(normalizePath))
+  const anchored = (i: BackupZipInfo) =>
+    i.missingMedia.filter((m) => !/(^|\/)recovered-from-/.test(m.targetPath)).length
+  const ordered = infos
+    .filter((i) => wanted.has(i.path) && i.missingMedia.length > 0)
+    .sort((a, b) => anchored(b) - anchored(a) || a.path.localeCompare(b.path))
+  const names = new Set<string>()
+  const out: PlannedPull[] = []
+  for (const info of ordered) {
+    for (const m of info.missingMedia) {
+      const name = basename(m.innerPath).toLowerCase()
+      if (names.has(name) || existing.has(m.targetPath)) continue
+      names.add(name)
+      out.push({ zipPath: info.path, innerPath: m.innerPath, targetPath: m.targetPath })
+    }
+  }
+  return out
+}
+
+/**
+ * Pull media that exists only inside the given backup zips out to their
+ * project paths (public/… etc). Never overwrites an existing file.
+ */
+export function pullMissingMediaFromZips(
+  files: Record<string, Uint8Array>,
+  zipPaths: Iterable<string>,
+): Record<string, Uint8Array> {
+  const plan = planMediaPulls(analyzeBackupZips(files), zipPaths, Object.keys(files))
+  const out: Record<string, Uint8Array> = {}
+  const cache = new Map<string, Record<string, Uint8Array>>()
+  for (const p of plan) {
+    let inner = cache.get(p.zipPath)
+    if (!inner) {
+      const key = findFileKey(files, p.zipPath)
+      if (!key) continue
+      inner = unzipMedia(files[key]!)
+      cache.set(p.zipPath, inner)
+    }
+    const b = inner[p.innerPath]
+    if (b) out[p.targetPath] = b
+  }
+  return out
+}
+
 export const WAV_CONVERT_WARN = {
   count: 8,
   totalBytes: 40 * 1024 * 1024,
@@ -361,6 +671,7 @@ export type MediaEntry = {
   kind: MediaKind
   size: number
   mime: string
+  protectedBy: ProtectReason | null
 }
 
 const IMAGE_EXTS = new Set([
@@ -427,20 +738,24 @@ export function listMediaEntries(
   opts?: CleanOptions,
 ): MediaEntry[] {
   const out: MediaEntry[] = []
+  const protection = computeProtection(files)
   for (const [rawPath, bytes] of Object.entries(files)) {
     const path = normalizePath(rawPath)
     if (!path || path.endsWith('/')) continue
     const kind = mediaKindFromPath(path)
     if (!kind) continue
     if (opts) {
-      const { remove } = classifyPath(path, opts)
+      const { remove } = classifyWithProtection(path, opts, protection)
       if (remove) continue
+    } else if (isInsideJunkFolder(path)) {
+      continue
     }
     out.push({
       path,
       kind,
       size: bytes.byteLength,
       mime: mimeForMediaPath(path),
+      protectedBy: protection.get(path) ?? null,
     })
   }
   out.sort((a, b) => {
@@ -769,13 +1084,20 @@ function summarizeFromFiles(
   let removeSize = 0
   let keepCount = 0
   let keepSize = 0
+  let protectedSaved = 0
+  const protection = computeProtection(files)
 
   for (const [rawPath, bytes] of Object.entries(files)) {
     const path = normalizePath(rawPath)
     const size = bytes.byteLength
-    const { remove, bucket } = classifyPath(path, opts)
+    const { remove, bucket, protectedBy, savedFrom } = classifyWithProtection(
+      path,
+      opts,
+      protection,
+    )
+    if (savedFrom) protectedSaved += 1
 
-    entries.push({ path, size, remove, bucket })
+    entries.push({ path, size, remove, bucket, protectedBy, savedFrom })
     totalSize += size
 
     if (remove && bucket) {
@@ -819,6 +1141,7 @@ function summarizeFromFiles(
     viteScriptFix,
     hostStrip,
     wavConvertCandidates,
+    protectedSaved,
   }
 }
 
@@ -1271,17 +1594,27 @@ export async function buildCleanZip(
   passwordGate?: PasswordGateOptions,
   wallet?: WalletVisibilityOptions,
   easterEgg?: CapEasterEggOptions,
+  /** Files to add before zipping (e.g. images pulled out of a backup zip). Never overwrites. */
+  addFiles?: Record<string, Uint8Array> | null,
 ): Promise<BuildCleanZipResult> {
   onProgress?.({ phase: 'stripping', message: 'Applying strip rules…' })
 
   const extraRemove = toRemovePathSet(extraRemovePaths)
+  const protection = computeProtection(files)
 
   const kept: Record<string, Uint8Array> = {}
   for (const [rawPath, bytes] of Object.entries(files)) {
     const path = normalizePath(rawPath)
-    const { remove } = classifyPath(path, opts)
+    const { remove } = classifyWithProtection(path, opts, protection)
     if (remove || extraRemove.has(path)) continue
     kept[path] = bytes
+  }
+  if (addFiles) {
+    for (const [rawPath, bytes] of Object.entries(addFiles)) {
+      const path = normalizePath(rawPath)
+      if (!path || kept[path]) continue
+      kept[path] = bytes
+    }
   }
 
   const failures: WavConvertFailure[] = []

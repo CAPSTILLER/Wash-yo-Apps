@@ -1,13 +1,14 @@
 {
   "name": "wash-yo-apps",
   "private": true,
-  "version": "3.8.0",
+  "version": "3.9.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
     "lint": "oxlint",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test": "node --test test/*.test.mjs"
   },
   "dependencies": {
     "@ffmpeg/ffmpeg": "^0.12.15",
@@ -27,5 +28,5 @@
     "typescript": "~6.0.2",
     "vite": "^8.3.0"
   },
-  "description": "Wash yo Apps \u2014 Capstiller zip ship cleaner for Gear / Vercel deploys"
+  "description": "Wash yo Apps — Capstiller zip ship cleaner for Gear / Vercel deploys"
 }

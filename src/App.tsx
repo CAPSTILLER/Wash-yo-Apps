@@ -6,10 +6,11 @@ import {
   type GithubUploadHelper,
   type InjectionSummary,
   type PasswordGateOptions,
-  type RemovalBucket,
   type ScanResult,
   type WavConvertFailure,
+  analyzeBackupZips,
   buildCleanZip,
+  pullMissingMediaFromZips,
   downloadBlob,
   formatBytes,
   listMediaEntries,
@@ -29,6 +30,8 @@ import {
   type PwaPackOptions,
 } from './lib/pwaPack'
 import { MediaReview } from './MediaReview'
+import { CleanReview, ConfirmClean } from './CleanReview'
+import { buildReviewPlan } from './lib/reviewPlan'
 import { TweakMode } from './TweakMode'
 
 const HUGE_MB = 80
@@ -100,18 +103,6 @@ const TOGGLE_META: {
   },
 ]
 
-const BUCKET_LABELS: Record<RemovalBucket, string> = {
-  node_modules: 'node_modules',
-  build_dirs: 'build/cache dirs',
-  git: '.git',
-  os_junk: 'OS junk',
-  vercel: '.vercel',
-  '.grok': '.grok / grok leftovers',
-  sandbox_crumbs: 'sandbox ID crumbs',
-  logs: '*.log',
-  wav: '*.wav',
-  other: 'other',
-}
 
 function Toggle({
   checked,
@@ -306,6 +297,13 @@ export default function App() {
   const [mediaRemovePaths, setMediaRemovePaths] = useState<Set<string>>(
     () => new Set(),
   )
+  /** Backup zips (*.zip inside the upload) Cap chose to remove — default keep */
+  const [zipRemovePaths, setZipRemovePaths] = useState<Set<string>>(
+    () => new Set(),
+  )
+  const [pullMissing, setPullMissing] = useState(true)
+  /** Final confirm step — nothing is removed until Cap confirms */
+  const [confirming, setConfirming] = useState(false)
 
   const [appName, setAppName] = useState('')
   const [shortName, setShortName] = useState('')
@@ -350,6 +348,9 @@ export default function App() {
     setInjections(null)
     setGithubUpload(null)
     setMediaRemovePaths(new Set())
+    setZipRemovePaths(new Set())
+    setPullMissing(true)
+    setConfirming(false)
     setBusy(false)
     setOutputZipName('')
     if (inputRef.current) inputRef.current.value = ''
@@ -386,6 +387,9 @@ export default function App() {
       setInjections(null)
       setGithubUpload(null)
       setMediaRemovePaths(new Set())
+      setZipRemovePaths(new Set())
+      setPullMissing(true)
+      setConfirming(false)
       if (!file.name.toLowerCase().endsWith('.zip')) {
         setError('Please upload a .zip file.')
         return
@@ -513,6 +517,11 @@ export default function App() {
     setGithubUpload(null)
     try {
       setStatus('Building Vercel-ready zip…')
+      const removeSet = new Set([...mediaRemovePaths, ...zipRemovePaths])
+      const pulled =
+        pullMissing && zipRemovePaths.size > 0
+          ? pullMissingMediaFromZips(filesRef.current, zipRemovePaths)
+          : null
       const {
         zip: out,
         converted,
@@ -524,17 +533,21 @@ export default function App() {
         opts,
         (p) => setStatus(p.message),
         pwaOpts,
-        mediaRemovePaths,
+        removeSet,
         gateOpts,
         walletOpts,
         eggOpts,
+        pulled,
       )
       setConvertFailures(failures)
       setInjections(inj)
       setGithubUpload(gh)
       const outName = resolveOutputZipName(outputZipName, suggestOutName(fileName))
       downloadBlob(out, outName)
+      setConfirming(false)
       const extra: string[] = []
+      const pulledN = pulled ? Object.keys(pulled).length : 0
+      if (pulledN > 0) extra.push(`pulled ${pulledN} image(s) out of backup zips`)
       if (opts.fixViteScripts && scan?.viteScriptFix.willApply) {
         extra.push('Vite scripts fixed')
       }
@@ -567,7 +580,7 @@ export default function App() {
     } finally {
       setBusy(false)
     }
-  }, [fileName, opts, scan, addPwa, appName, iconBytes, pwaOpts, mediaRemovePaths, addGate, gateAdminPassword, gateUserPassword, gateOpts, walletOpts, eggOpts, outputZipName])
+  }, [fileName, opts, scan, addPwa, appName, iconBytes, pwaOpts, mediaRemovePaths, addGate, gateAdminPassword, gateUserPassword, gateOpts, walletOpts, eggOpts, outputZipName, zipRemovePaths, pullMissing])
 
   const setOpt = (key: keyof CleanOptions, value: boolean) => {
     setOpts((prev) => ({ ...prev, [key]: value }))
@@ -592,23 +605,6 @@ export default function App() {
     })
     maybeEnablePwa(appName, true)
   }, [appName])
-
-  const removalRows = useMemo(() => {
-    if (!scan) return []
-    return (Object.keys(BUCKET_LABELS) as RemovalBucket[])
-      .filter((b) => scan.byBucket[b].count > 0)
-      .map((b) => ({
-        key: b,
-        label: BUCKET_LABELS[b],
-        count: scan.byBucket[b].count,
-        size: scan.byBucket[b].size,
-      }))
-  }, [scan])
-
-  const sampleRemovals = useMemo(() => {
-    if (!scan) return []
-    return scan.entries.filter((e) => e.remove).slice(0, 80)
-  }, [scan])
 
   const convertWarn = useMemo(() => {
     if (!scan || !opts.convertWavToMp3) return null
@@ -642,6 +638,29 @@ export default function App() {
     return { size, count }
   }, [mediaEntries, mediaRemovePaths])
 
+  const backupZips = useMemo(
+    () => (scan ? analyzeBackupZips(scan.files) : []),
+    [scan],
+  )
+
+  const reviewPlan = useMemo(() => {
+    if (!scan) return null
+    return buildReviewPlan(
+      scan,
+      { mediaRemove: mediaRemovePaths, zipRemove: zipRemovePaths, pullMissing },
+      backupZips,
+    )
+  }, [scan, mediaRemovePaths, zipRemovePaths, pullMissing, backupZips])
+
+  const openConfirm = () => {
+    setConfirming(true)
+    requestAnimationFrame(() =>
+      document
+        .getElementById('confirm-clean')
+        ?.scrollIntoView({ behavior: 'smooth', block: 'center' }),
+    )
+  }
+
   const shortPlaceholder = defaultShortName(appName) || 'e.g. Gear Up'
 
   return (
@@ -658,7 +677,7 @@ export default function App() {
             Drop a project zip, give it an app name and icon, download a cleaned
             zip ready for Vercel. Install metadata (manifest + icons) so device
             home screens show the name under the icon. Everything stays in this
-            browser. v3.8.0 bakes <span className="text-amber-300">Base / OKX wallet preview</span> (Open Graph + Twitter + og.jpg) into Clean/PWA, optional custom output zip name, and an optional <span className="text-cyan-300">CAPSTILLER Easter egg</span>. Soft password gate (v3.7) still available. Tweak mode and Clean still rewrite
+            browser. v3.9.0 never auto-removes images, sounds, public/ or files your code uses, groups everything into a clear review list, and asks before removing anything. v3.8.0 bakes <span className="text-amber-300">Base / OKX wallet preview</span> (Open Graph + Twitter + og.jpg) into Clean/PWA, optional custom output zip name, and an optional <span className="text-cyan-300">CAPSTILLER Easter egg</span>. Soft password gate (v3.7) still available. Tweak mode and Clean still rewrite
             leftover <span className="text-zinc-300">/__grok/</span> hrefs,
             Media review, grok leftovers strip, GitHub helper, Vercel fixes, and
             force-strips{' '}
@@ -1096,12 +1115,12 @@ export default function App() {
                 />
                 <Stat
                   label="Will remove"
-                  value={`${scan.removeCount} · ${formatBytes(scan.removeSize)}`}
+                  value={`${reviewPlan?.removeCount ?? scan.removeCount} · ${formatBytes(reviewPlan?.removeSize ?? scan.removeSize)}`}
                   accent="amber"
                 />
                 <Stat
                   label="After (est.)"
-                  value={`${scan.keepCount} · ${formatBytes(scan.keepSize)}`}
+                  value={`${reviewPlan?.keepCount ?? scan.keepCount} · ${formatBytes(reviewPlan?.keepSize ?? scan.keepSize)}`}
                   accent="cyan"
                 />
               </div>
@@ -1201,12 +1220,13 @@ export default function App() {
                   type="button"
                   disabled={
                     busy ||
-                    scan.keepCount - mediaRemoveSize.count <= 0
+                    confirming ||
+                    (reviewPlan ? reviewPlan.keepCount <= 0 : true)
                   }
-                  onClick={() => void onPackDownload()}
-                  className="rounded-lg bg-amber-400 hover:bg-amber-300 disabled:opacity-40 disabled:cursor-not-allowed text-zinc-950 font-semibold px-5 py-2.5 text-sm transition-colors"
+                  onClick={openConfirm}
+                  className="rounded-lg bg-amber-400 hover:bg-amber-300 disabled:opacity-40 disabled:cursor-not-allowed text-zinc-950 font-semibold px-5 py-3 text-sm transition-colors"
                 >
-                  {busy ? 'Working…' : 'Download Vercel-ready zip'}
+                  {busy ? 'Working…' : 'Clean & download…'}
                 </button>
                 <span className="text-xs text-zinc-500">
                   Archive on disk: {formatBytes(fileBytes)} → output is freshly
@@ -1214,6 +1234,26 @@ export default function App() {
                 </span>
               </div>
             </div>
+
+            {confirming && reviewPlan ? (
+              <ConfirmClean
+                plan={reviewPlan}
+                busy={busy}
+                onConfirm={() => void onPackDownload()}
+                onBack={() => setConfirming(false)}
+              />
+            ) : null}
+
+            {reviewPlan ? (
+              <CleanReview
+                plan={reviewPlan}
+                zips={backupZips}
+                zipRemove={zipRemovePaths}
+                onZipRemove={setZipRemovePaths}
+                pullMissing={pullMissing}
+                onPullMissing={setPullMissing}
+              />
+            ) : null}
 
             <MediaReview
               entries={mediaEntries}
@@ -1364,53 +1404,6 @@ export default function App() {
               </div>
             ) : null}
 
-            {removalRows.length > 0 ? (
-              <div className="rounded-xl border border-zinc-800 bg-zinc-900/40 p-5">
-                <h3 className="text-sm font-medium text-zinc-300 mb-3">
-                  Removal summary
-                </h3>
-                <ul className="space-y-1.5 text-sm">
-                  {removalRows.map((r) => (
-                    <li
-                      key={r.key}
-                      className="flex justify-between gap-4 text-zinc-400"
-                    >
-                      <span>{r.label}</span>
-                      <span className="text-zinc-300 tabular-nums">
-                        {r.count} · {formatBytes(r.size)}
-                      </span>
-                    </li>
-                  ))}
-                </ul>
-              </div>
-            ) : (
-              <p className="text-sm text-zinc-500">
-                Nothing matched current strip rules — zip already looks clean.
-              </p>
-            )}
-
-            {sampleRemovals.length > 0 ? (
-              <div className="rounded-xl border border-zinc-800 bg-zinc-900/40 p-5">
-                <h3 className="text-sm font-medium text-zinc-300 mb-3">
-                  Paths to remove
-                  {scan.removeCount > sampleRemovals.length
-                    ? ` (showing ${sampleRemovals.length} of ${scan.removeCount})`
-                    : ''}
-                </h3>
-                <div className="max-h-56 overflow-auto rounded-lg bg-zinc-950/80 border border-zinc-800/80 p-3 font-mono text-xs text-zinc-400 space-y-0.5">
-                  {sampleRemovals.map((e) => (
-                    <div key={e.path} className="flex justify-between gap-2">
-                      <span className="truncate text-amber-200/80">
-                        {e.path}
-                      </span>
-                      <span className="shrink-0 text-zinc-600">
-                        {formatBytes(e.size)}
-                      </span>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            ) : null}
           </section>
         ) : null}
 
@@ -1418,7 +1411,7 @@ export default function App() {
         )}
 
         <footer className="mt-12 pt-6 border-t border-zinc-900 text-xs text-zinc-600">
-          Zip Ship Cleaner v3.8.0 · Capstiller Vercel Ship Packager · No server
+          Zip Ship Cleaner v3.9.0 · Protected images + confirm step · Capstiller Vercel Ship Packager · No server
           · Privacy: data stays in this tab · Clean + Tweak modes · Rewrites
           /__grok/ icon+manifest hrefs · Media review · PWA install icons ·
           Force-strips --host · Vercel UNRESOLVED_IMPORT fixes · Grok leftovers
