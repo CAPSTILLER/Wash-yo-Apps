@@ -1,3 +1,6 @@
+import AppIconStep, { type AppIconApplier } from './AppIconStep'
+import type { AppIconResult } from './lib/appIcon'
+import { unzipSync, zipSync } from 'fflate'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   BUILD_DIR_NAMES,
@@ -326,6 +329,9 @@ export default function App() {
   const inputRef = useRef<HTMLInputElement>(null)
   const iconInputRef = useRef<HTMLInputElement>(null)
   const filesRef = useRef<Record<string, Uint8Array> | null>(null)
+  const [appIconApplier, setAppIconApplierState] = useState<AppIconApplier | null>(null)
+  const setAppIconApplier = useCallback((fn: AppIconApplier | null) => setAppIconApplierState(() => fn), [])
+  const [appIconResult, setAppIconResult] = useState<AppIconResult | null>(null)
 
   const clearIcon = useCallback(() => {
     setIconPreview((prev) => {
@@ -522,7 +528,8 @@ export default function App() {
         pullMissing && zipRemovePaths.size > 0
           ? pullMissingMediaFromZips(filesRef.current, zipRemovePaths)
           : null
-      const {
+      setAppIconResult(null)
+      let {
         zip: out,
         converted,
         failures,
@@ -539,6 +546,15 @@ export default function App() {
         eggOpts,
         pulled,
       )
+      let appIconNote = ''
+      if (appIconApplier) {
+        setStatus('Adding app icon…')
+        const unz = unzipSync(out)
+        const res = await appIconApplier(unz)
+        out = zipSync(unz, { level: 6 })
+        setAppIconResult(res)
+        appIconNote = 'app icon'
+      }
       setConvertFailures(failures)
       setInjections(inj)
       setGithubUpload(gh)
@@ -556,6 +572,7 @@ export default function App() {
       if (inj.walletOgImagePath) extra.push('wallet / store preview')
       if (inj.gateConfigPath) extra.push('password gate')
       if (inj.eggAssetPath) extra.push('CAPSTILLER egg')
+      if (appIconNote) extra.push(appIconNote)
       if (opts.convertWavToMp3 && (converted > 0 || failures.length > 0)) {
         extra.push(
           `converted ${converted} WAV→MP3${
@@ -580,7 +597,7 @@ export default function App() {
     } finally {
       setBusy(false)
     }
-  }, [fileName, opts, scan, addPwa, appName, iconBytes, pwaOpts, mediaRemovePaths, addGate, gateAdminPassword, gateUserPassword, gateOpts, walletOpts, eggOpts, outputZipName, zipRemovePaths, pullMissing])
+  }, [fileName, opts, scan, addPwa, appName, iconBytes, pwaOpts, mediaRemovePaths, addGate, gateAdminPassword, gateUserPassword, gateOpts, walletOpts, eggOpts, outputZipName, zipRemovePaths, pullMissing, appIconApplier])
 
   const setOpt = (key: keyof CleanOptions, value: boolean) => {
     setOpts((prev) => ({ ...prev, [key]: value }))
@@ -940,6 +957,15 @@ export default function App() {
             </label>
           </div>
         </section>
+
+        {mode === 'clean' ? (
+          <AppIconStep
+            files={scan ? scan.files : null}
+            fileName={fileName}
+            onApplier={setAppIconApplier}
+            lastResult={appIconResult}
+          />
+        ) : null}
 
         <section className="mt-8">
           <h2 className="text-sm font-medium text-cyan-200/90 mb-1">
