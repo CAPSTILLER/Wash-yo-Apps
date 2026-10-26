@@ -186,7 +186,7 @@ function ownedKeys(m: AppIconMeta): Set<string> {
 
 export function patchHtmlHead(html: string, m: AppIconMeta): { html: string; removed: number } {
   const owned = ownedKeys(m)
-  let out = html.replace(new RegExp(`\\s*${MARK_START}[\\s\\S]*?${MARK_END}`, 'g'), '')
+  let out = html.replace(new RegExp(`\\n?[ \\t]*${MARK_START}[\\s\\S]*?${MARK_END}`, 'g'), '')
   let removed = 0
   out = out.replace(/[ \t]*<link\b[^>]*>[ \t]*\r?\n?/gi, (tag) => {
     const rel = tag.match(/\brel\s*=\s*["']([^"']+)["']/i)?.[1]?.trim()
@@ -202,8 +202,11 @@ export function patchHtmlHead(html: string, m: AppIconMeta): { html: string; rem
     if (/<title\b[^>]*>[\s\S]*?<\/title>/i.test(out)) out = out.replace(/<title\b[^>]*>[\s\S]*?<\/title>/i, `<title>${escapeHtml(m.title)}</title>`)
     else out = insertHead(out, `<title>${escapeHtml(m.title)}</title>\n`)
   }
-  const block = `${MARK_START}\n${headTags(m).join('\n')}\n${MARK_END}\n`
-  out = insertHead(out, block)
+  const ind = out.match(/\n([ \t]*)<(?:title|meta)\b/i)?.[1] ?? '    '
+  const block = [MARK_START, ...headTags(m), MARK_END].map((l) => ind + l).join('\n')
+  out = /<\/title>/i.test(out)
+    ? out.replace(/<\/title>/i, (t) => `${t}\n${block}`)
+    : insertHead(out, block.trimStart() + '\n' + ind)
   return { html: out, removed }
 }
 

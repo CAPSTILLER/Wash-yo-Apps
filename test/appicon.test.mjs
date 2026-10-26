@@ -71,3 +71,14 @@ test('guess site url + ico header', async () => {
   const ico = buildIco([{ size: 16, png: b(10) }, { size: 32, png: b(10) }])
   assert.deepEqual([...ico.slice(0, 6)], [0, 0, 1, 0, 2, 0])
 })
+
+test('html head block keeps indentation and is idempotent', async () => {
+  const { patchHtmlHead } = await L()
+  const m = { siteUrl: 'https://x.example', title: 'X', description: 'd', themeColor: '#000' }
+  const h = '<html>\n  <head>\n    <meta charset="UTF-8" />\n    <title>Old</title>\n    <meta name="viewport" content="w" />\n  </head>\n</html>\n'
+  const a = patchHtmlHead(h, m).html
+  assert.equal(patchHtmlHead(a, m).html, a)
+  assert.match(a, /\n    <!-- wash-yo-apps:app-icon -->\n    <link/)
+  assert.match(a, /\n    <meta name="viewport"/)
+  assert.match(a, /\n  <\/head>/)
+})
